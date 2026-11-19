@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/csv"
 	"encoding/hex"
@@ -1056,8 +1057,9 @@ func doLoopWithDeps(deps loopDeps, idxUrl, providersUrl string, fromBlock uint32
 			}
 
 			var providerUpdated bool
+			order := candidateOrder(id, providers)
 		nextProvider:
-			for _, prv := range providers {
+			for _, prv := range order {
 				if len(newProviders) == *replicas {
 					break
 				}
@@ -1727,6 +1729,21 @@ func reserveProviderSpace(prv *Provider, bagSizeBytes uint64) {
 		return
 	}
 	prv.UsedProviderSpaceGB += bytesToGB(bagSizeBytes)
+}
+
+// candidateOrder sorts providers by sha256(bagID || key), giving every bag its own
+// stable order that does not shift when providers join or leave the API list.
+func candidateOrder(bagID []byte, providers []*Provider) []*Provider {
+	rank := func(p *Provider) []byte {
+		h := sha256.Sum256(append(append([]byte{}, bagID...), p.ID...))
+		return h[:]
+	}
+
+	ordered := append([]*Provider{}, providers...)
+	sort.Slice(ordered, func(i, j int) bool {
+		return bytes.Compare(rank(ordered[i]), rank(ordered[j])) < 0
+	})
+	return ordered
 }
 
 func initWallet(apiClient wallet.TonAPI, key ed25519.PrivateKey) (*wallet.Wallet, error) {

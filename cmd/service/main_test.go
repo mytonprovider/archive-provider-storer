@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -806,4 +807,112 @@ func TestReserveProviderSpaceTracksUsageInLoop(t *testing.T) {
 	if providerAllowsArchiveBag(prv, 6<<30, 90) {
 		t.Fatalf("second bag should not fit after reserve, used=%.2f", prv.UsedProviderSpaceGB)
 	}
+}
+
+func TestCandidateOrder(t *testing.T) {
+	var providers []*Provider
+	for i := byte(1); i <= 10; i++ {
+		providers = append(providers, &Provider{ID: testKey(i)})
+	}
+	input := append([]*Provider{}, providers...)
+	bagA, bagB := testKey(0xa1), testKey(0xb2)
+
+	order := candidateOrder(bagA, providers)
+	if len(order) != len(providers) {
+		t.Fatalf("order length mismatch: got %d, want %d", len(order), len(providers))
+	}
+	if !sameProviderOrder(providers, input) {
+		t.Fatal("input slice was reordered")
+	}
+	if !sameProviderOrder(candidateOrder(bagA, providers), order) {
+		t.Fatal("same bag got a different order")
+	}
+
+	reversed := make([]*Provider, len(providers))
+	for i, p := range providers {
+		reversed[len(providers)-1-i] = p
+	}
+	if !sameProviderOrder(candidateOrder(bagA, reversed), order) {
+		t.Fatal("order depends on the input order")
+	}
+
+	var rest []*Provider
+	for _, p := range order {
+		if p != providers[0] {
+			rest = append(rest, p)
+		}
+	}
+	if !sameProviderOrder(candidateOrder(bagA, providers[1:]), rest) {
+		t.Fatal("removing a provider moved the others")
+	}
+
+	if sameProviderOrder(candidateOrder(bagB, providers), order) {
+		t.Fatal("different bags got the same order")
+	}
+}
+
+func TestDoLoopAssignsBagInCandidateOrder(t *testing.T) {
+	withLoopTestEnv(t)
+	*replicas = 1
+	*noTx = true
+
+	bag := testBagDetailed()
+	preloadBags(t, []*storage.BagDetailed{bag})
+
+	var keys [][]byte
+	var providers []*Provider
+	// for this bag 0x71, the top of the API list, is the last candidate
+	for i := byte(0x71); i <= 0x75; i++ {
+		keys = append(keys, testKey(i))
+		providers = append(providers, &Provider{ID: testKey(i)})
+	}
+	var providerRequests atomic.Int32
+	srv := newLoopHTTPServer(t, bag.BagID, keys, &providerRequests)
+	defer srv.Close()
+
+	bagID, err := hex.DecodeString(bag.BagID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := candidateOrder(bagID, providers)[0].ID
+	if hex.EncodeToString(want) == hex.EncodeToString(keys[0]) {
+		t.Fatal("test bag must have a first candidate other than the top of the API list")
+	}
+
+	deps := loopDeps{
+		wallet:     testWallet(tlb.MustFromTON("100")),
+		storage:    &fakeStorage{},
+		provider:   &fakeProvider{rates: testAvailableRates()},
+		api:        &fakeAPI{},
+		httpClient: srv.Client(),
+		waitMaster: func(ctx context.Context, api ton.APIClientWrapped, minSeqno uint32) (*ton.BlockIDExt, error) {
+			return testMaster(100), nil
+		},
+		sendManyWait: func(ctx context.Context, wl loopWallet, api ton.APIClientWrapped, messages []*wallet.Message, minSeqno uint32) (*tlb.Transaction, *ton.BlockIDExt, error) {
+			t.Fatalf("unexpected transaction send with %d messages", len(messages))
+			return nil, nil, nil
+		},
+	}
+
+	if _, err := doLoopWithDeps(deps, srv.URL+"/index", srv.URL+"/providers", 0); err != nil {
+		t.Fatalf("doLoopWithDeps returned error: %v", err)
+	}
+	if len(addedProviders) != 1 {
+		t.Fatalf("added providers mismatch: got %d, want 1", len(addedProviders))
+	}
+	if _, ok := addedProviders[base64.StdEncoding.EncodeToString(want)+"_"+bag.BagID]; !ok {
+		t.Fatalf("bag was not given to the first candidate %x: got %v", want, addedProviders)
+	}
+}
+
+func sameProviderOrder(a, b []*Provider) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
