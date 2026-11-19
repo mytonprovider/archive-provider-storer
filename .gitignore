@@ -2,3 +2,8 @@
 main
 *.csv
 *.json
+.docs/
+.files/
+CLAUDE.md
+storage-db/
+provider-store/
