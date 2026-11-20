@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"os"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -44,6 +45,9 @@ type Provider struct {
 	ID            []byte
 	BagsNum       int
 	WaitingForBag string
+
+	// Country ISO code from mytonprovider location, empty if unknown.
+	Country string
 
 	// Provider space from mytonprovider telemetry (GB). Required to assign archive bags.
 	HasProviderSpaceTelemetry bool
@@ -75,6 +79,9 @@ type MTPResponse struct {
 			TotalProviderSpace *float32 `json:"total_provider_space"`
 			UsedProviderSpace  *float32 `json:"used_provider_space"`
 		} `json:"telemetry"`
+		Location struct {
+			CountryISO string `json:"country_iso"`
+		} `json:"location"`
 	} `json:"providers"`
 }
 
@@ -820,7 +827,7 @@ func doLoopWithDeps(deps loopDeps, idxUrl, providersUrl string, fromBlock uint32
 			continue
 		}
 
-		prv := &Provider{ID: key}
+		prv := &Provider{ID: key, Country: strings.ToUpper(p.Location.CountryISO)}
 		if p.Telemetry.TotalProviderSpace != nil && p.Telemetry.UsedProviderSpace != nil {
 			prv.HasProviderSpaceTelemetry = true
 			prv.TotalProviderSpaceGB = float64(*p.Telemetry.TotalProviderSpace)
@@ -1056,124 +1063,155 @@ func doLoopWithDeps(deps loopDeps, idxUrl, providersUrl string, fromBlock uint32
 				})
 			}
 
+			bagCountries := map[string]bool{}
+			for _, vp := range validProviders {
+				// a replica missing from the API list has unknown country
+				country := ""
+				for _, p := range providers {
+					if bytes.Equal(p.ID, vp.Key) {
+						country = p.Country
+						break
+					}
+				}
+				bagCountries[country] = true
+			}
+
+			// per bag, not like noRespCache: a refusal may depend on the bag size
+			askedProviders := map[string]bool{}
+
 			var providerUpdated bool
 			order := candidateOrder(id, providers)
-		nextProvider:
-			for _, prv := range order {
-				if len(newProviders) == *replicas {
-					break
-				}
-				if prv.WaitingForBag != "" {
-					log.Debug().Str("bag", dt.BagID).Str("waiting", prv.WaitingForBag).Hex("provider", prv.ID).Msg("provider is waiting for another bag confirmation")
-					continue
-				}
-
-				if prv.BagsNum >= *maxBagsPerProvider {
-					log.Debug().Str("bag", dt.BagID).Hex("provider", prv.ID).Msg("provider has too many bags, skip")
-					continue
-				}
-
-				if !prv.HasProviderSpaceTelemetry || prv.TotalProviderSpaceGB <= 0 {
-					log.Debug().Str("bag", dt.BagID).Hex("provider", prv.ID).Msg("provider has no space telemetry, skip")
-					continue
-				}
-				if !providerAllowsArchiveBag(prv, dt.BagSize, *maxProviderFillPercent) {
-					log.Debug().
-						Str("bag", dt.BagID).
-						Hex("provider", prv.ID).
-						Float64("used_gb", prv.UsedProviderSpaceGB).
-						Float64("total_gb", prv.TotalProviderSpaceGB).
-						Int("fill_percent", *maxProviderFillPercent).
-						Msg("provider fill limit reached, skip")
-					continue
-				}
-
-				for _, newProvider := range newProviders {
-					if bytes.Equal(prv.ID, newProvider.Address.Data()) {
-						// already exists
-						continue nextProvider
+			// first pass takes only countries the bag does not have yet
+			for pass := 0; pass < 2; pass++ {
+			nextProvider:
+				for _, prv := range order {
+					if len(newProviders) == *replicas {
+						break
 					}
-				}
-
-				log.Debug().Str("bag", dt.BagID).Hex("provider", prv.ID).Msg("requesting provider storage rates")
-
-				if noRespCache[string(prv.ID)] {
-					log.Debug().Str("bag", dt.BagID).Hex("provider", prv.ID).Msg("skipped, not respond before (cached)")
-					continue
-				}
-
-				ctx, cancel = context.WithTimeout(context.Background(), 15*time.Second)
-				rates, err := deps.provider.GetStorageRates(ctx, prv.ID, dt.BagSize)
-				cancel()
-				if err != nil {
-					noRespCache[string(prv.ID)] = true
-					log.Error().Err(err).Str("bag", dt.BagID).Hex("provider", prv.ID).Msg("failed to get rates")
-					continue
-				}
-
-				if !rates.Available || rates.SpaceAvailableMB < dt.BagSize>>20 {
-					log.Debug().Str("bag", dt.BagID).Hex("provider", prv.ID).Msg("not available")
-					continue
-				}
-
-				if rates.MaxSpan > uint32(*maxSpanAllowed) {
-					rates.MaxSpan = uint32(*maxSpanAllowed)
-				}
-
-				if rates.MaxSpan < rates.MinSpan {
-					log.Debug().Str("bag", dt.BagID).Hex("provider", prv.ID).Msg("max span too low, skip")
-					continue
-				}
-
-				perMB := tlb.FromNanoTON(new(big.Int).SetBytes(rates.RatePerMBDay))
-				offer := provider.CalculateBestProviderOffer(&provider.ProviderRates{
-					Available:        rates.Available,
-					RatePerMBDay:     perMB,
-					MinBounty:        tlb.FromNanoTON(new(big.Int).SetBytes(rates.MinBounty)),
-					SpaceAvailableMB: rates.SpaceAvailableMB,
-					MinSpan:          rates.MinSpan,
-					MaxSpan:          rates.MaxSpan,
-					Size:             dt.BagSize,
-				})
-
-				if offer.PerProofNano.Cmp(minRewardToVerify.Nano()) > 0 {
-					// not typical price, check per mb
-					if offer.RatePerMBNano.Cmp(maxPerMB.Nano()) > 0 {
-						log.Debug().Str("bag", dt.BagID).Hex("provider", prv.ID).Msg("rate too high, skip")
+					if prv.WaitingForBag != "" {
+						log.Debug().Str("bag", dt.BagID).Str("waiting", prv.WaitingForBag).Hex("provider", prv.ID).Msg("provider is waiting for another bag confirmation")
 						continue
 					}
+
+					if prv.BagsNum >= *maxBagsPerProvider {
+						log.Debug().Str("bag", dt.BagID).Hex("provider", prv.ID).Msg("provider has too many bags, skip")
+						continue
+					}
+
+					if !prv.HasProviderSpaceTelemetry || prv.TotalProviderSpaceGB <= 0 {
+						log.Debug().Str("bag", dt.BagID).Hex("provider", prv.ID).Msg("provider has no space telemetry, skip")
+						continue
+					}
+					if !providerAllowsArchiveBag(prv, dt.BagSize, *maxProviderFillPercent) {
+						log.Debug().
+							Str("bag", dt.BagID).
+							Hex("provider", prv.ID).
+							Float64("used_gb", prv.UsedProviderSpaceGB).
+							Float64("total_gb", prv.TotalProviderSpaceGB).
+							Int("fill_percent", *maxProviderFillPercent).
+							Msg("provider fill limit reached, skip")
+						continue
+					}
+
+					for _, newProvider := range newProviders {
+						if bytes.Equal(prv.ID, newProvider.Address.Data()) {
+							// already exists
+							continue nextProvider
+						}
+					}
+
+					if pass == 0 && bagCountries[prv.Country] {
+						log.Debug().Str("bag", dt.BagID).Hex("provider", prv.ID).Str("country", prv.Country).Msg("bag already has provider from this country, skip for now")
+						continue
+					}
+
+					if askedProviders[string(prv.ID)] {
+						log.Debug().Str("bag", dt.BagID).Hex("provider", prv.ID).Msg("already asked for this bag, skip")
+						continue
+					}
+
+					log.Debug().Str("bag", dt.BagID).Hex("provider", prv.ID).Msg("requesting provider storage rates")
+
+					if noRespCache[string(prv.ID)] {
+						log.Debug().Str("bag", dt.BagID).Hex("provider", prv.ID).Msg("skipped, not respond before (cached)")
+						continue
+					}
+
+					askedProviders[string(prv.ID)] = true
+					ctx, cancel = context.WithTimeout(context.Background(), 15*time.Second)
+					rates, err := deps.provider.GetStorageRates(ctx, prv.ID, dt.BagSize)
+					cancel()
+					if err != nil {
+						noRespCache[string(prv.ID)] = true
+						log.Error().Err(err).Str("bag", dt.BagID).Hex("provider", prv.ID).Msg("failed to get rates")
+						continue
+					}
+
+					if !rates.Available || rates.SpaceAvailableMB < dt.BagSize>>20 {
+						log.Debug().Str("bag", dt.BagID).Hex("provider", prv.ID).Msg("not available")
+						continue
+					}
+
+					if rates.MaxSpan > uint32(*maxSpanAllowed) {
+						rates.MaxSpan = uint32(*maxSpanAllowed)
+					}
+
+					if rates.MaxSpan < rates.MinSpan {
+						log.Debug().Str("bag", dt.BagID).Hex("provider", prv.ID).Msg("max span too low, skip")
+						continue
+					}
+
+					perMB := tlb.FromNanoTON(new(big.Int).SetBytes(rates.RatePerMBDay))
+					offer := provider.CalculateBestProviderOffer(&provider.ProviderRates{
+						Available:        rates.Available,
+						RatePerMBDay:     perMB,
+						MinBounty:        tlb.FromNanoTON(new(big.Int).SetBytes(rates.MinBounty)),
+						SpaceAvailableMB: rates.SpaceAvailableMB,
+						MinSpan:          rates.MinSpan,
+						MaxSpan:          rates.MaxSpan,
+						Size:             dt.BagSize,
+					})
+
+					if offer.PerProofNano.Cmp(minRewardToVerify.Nano()) > 0 {
+						// not typical price, check per mb
+						if offer.RatePerMBNano.Cmp(maxPerMB.Nano()) > 0 {
+							log.Debug().Str("bag", dt.BagID).Hex("provider", prv.ID).Msg("rate too high, skip")
+							continue
+						}
+					}
+
+					log.Info().Str("bag", dt.BagID).Hex("provider", prv.ID).Str("per_mb_day", perMB.String()).Msg("adding new provider")
+
+					prv.BagsNum++
+					reserveProviderSpace(prv, dt.BagSize)
+					newProviders = append(newProviders, contract.ProviderV1{
+						Address:       address.NewAddress(0, 0, prv.ID),
+						MaxSpan:       offer.Span,
+						PricePerMBDay: tlb.FromNanoTON(offer.RatePerMBNano),
+					})
+					notifications = append(notifications, &NotifyProvider{
+						ID:      prv.ID,
+						Address: addr,
+						ToProof: uint64(rand.Int()) % dt.BagSize,
+					})
+
+					bounty := new(big.Int).Mul(tlb.FromNanoTON(offer.RatePerMBNano).Nano(), big.NewInt(int64(dt.BagSize)))
+					bounty = bounty.Mul(bounty, big.NewInt(int64(offer.Span)))
+					bounty = bounty.Div(bounty, big.NewInt(24*60*60*1024*1024))
+
+					amt := tlb.MustFromNano(bounty, 9)
+					maxBalance = maxBalance.MustAdd(amt)
+					if amt.GreaterThan(minBalance) {
+						minBalance = amt
+					}
+
+					// remove provider for this loop, to not give him a new bag until he downloads it
+					prv.WaitingForBag = dt.BagID
+					addedProviders[base64.StdEncoding.EncodeToString(prv.ID)+"_"+dt.BagID] = time.Now()
+					bagCountries[prv.Country] = true
+
+					providerUpdated = true
 				}
-
-				log.Info().Str("bag", dt.BagID).Hex("provider", prv.ID).Str("per_mb_day", perMB.String()).Msg("adding new provider")
-
-				prv.BagsNum++
-				reserveProviderSpace(prv, dt.BagSize)
-				newProviders = append(newProviders, contract.ProviderV1{
-					Address:       address.NewAddress(0, 0, prv.ID),
-					MaxSpan:       offer.Span,
-					PricePerMBDay: tlb.FromNanoTON(offer.RatePerMBNano),
-				})
-				notifications = append(notifications, &NotifyProvider{
-					ID:      prv.ID,
-					Address: addr,
-					ToProof: uint64(rand.Int()) % dt.BagSize,
-				})
-
-				bounty := new(big.Int).Mul(tlb.FromNanoTON(offer.RatePerMBNano).Nano(), big.NewInt(int64(dt.BagSize)))
-				bounty = bounty.Mul(bounty, big.NewInt(int64(offer.Span)))
-				bounty = bounty.Div(bounty, big.NewInt(24*60*60*1024*1024))
-
-				amt := tlb.MustFromNano(bounty, 9)
-				maxBalance = maxBalance.MustAdd(amt)
-				if amt.GreaterThan(minBalance) {
-					minBalance = amt
-				}
-
-				// remove provider for this loop, to not give him a new bag until he downloads it
-				prv.WaitingForBag = dt.BagID
-				addedProviders[base64.StdEncoding.EncodeToString(prv.ID)+"_"+dt.BagID] = time.Now()
-
-				providerUpdated = true
 			}
 
 			if maxBalance.Nano().Cmp(contractBalance.Nano()) < 0 {

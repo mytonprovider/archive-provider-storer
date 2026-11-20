@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
@@ -37,7 +38,7 @@ func TestDoLoopAdvancesFromBlockAfterProcessingMaster(t *testing.T) {
 	preloadBags(t, []*storage.BagDetailed{bag})
 
 	var providerRequests atomic.Int32
-	srv := newLoopHTTPServer(t, bag.BagID, nil, &providerRequests)
+	srv := newLoopHTTPServer(t, bag.BagID, nil, nil, &providerRequests)
 	defer srv.Close()
 
 	api := &fakeAPI{}
@@ -117,7 +118,7 @@ func TestDoLoopTxTimeoutAdvancesToNextScannedBlock(t *testing.T) {
 
 	providerKey := testKey(0x44)
 	var providerRequests atomic.Int32
-	srv := newLoopHTTPServer(t, bag.BagID, [][]byte{providerKey}, &providerRequests)
+	srv := newLoopHTTPServer(t, bag.BagID, [][]byte{providerKey}, nil, &providerRequests)
 	defer srv.Close()
 
 	fProvider := &fakeProvider{rates: testAvailableRates()}
@@ -174,7 +175,7 @@ func TestDoLoopTxSendErrorReturnsNextBlockCheckpoint(t *testing.T) {
 
 	providerKey := testKey(0x44)
 	var providerRequests atomic.Int32
-	srv := newLoopHTTPServer(t, bag.BagID, [][]byte{providerKey}, &providerRequests)
+	srv := newLoopHTTPServer(t, bag.BagID, [][]byte{providerKey}, nil, &providerRequests)
 	defer srv.Close()
 
 	errSend := errors.New("send failed")
@@ -210,7 +211,7 @@ func TestDoLoopSkipsBagWhenHeaderWaitTimesOut(t *testing.T) {
 
 	bagID := hex.EncodeToString(testKey(0x77))
 	var providerRequests atomic.Int32
-	srv := newLoopHTTPServer(t, bagID, nil, &providerRequests)
+	srv := newLoopHTTPServer(t, bagID, nil, nil, &providerRequests)
 	defer srv.Close()
 
 	fStorage := &stuckHeaderStorage{}
@@ -468,7 +469,7 @@ func withLoopTestEnv(t *testing.T) {
 	})
 }
 
-func newLoopHTTPServer(t *testing.T, bagID string, providerKeys [][]byte, providerRequests *atomic.Int32) *httptest.Server {
+func newLoopHTTPServer(t *testing.T, bagID string, providerKeys [][]byte, countries []string, providerRequests *atomic.Int32) *httptest.Server {
 	t.Helper()
 
 	mux := http.NewServeMux()
@@ -486,14 +487,18 @@ func newLoopHTTPServer(t *testing.T, bagID string, providerKeys [][]byte, provid
 		providerRequests.Add(1)
 
 		list := make([]map[string]any, 0, len(providerKeys))
-		for _, key := range providerKeys {
-			list = append(list, map[string]any{
+		for i, key := range providerKeys {
+			entry := map[string]any{
 				"pubkey": hex.EncodeToString(key),
 				"telemetry": map[string]float32{
 					"total_provider_space": 1000,
 					"used_provider_space":  0,
 				},
-			})
+			}
+			if i < len(countries) {
+				entry["location"] = map[string]string{"country_iso": countries[i]}
+			}
+			list = append(list, entry)
 		}
 		if err := json.NewEncoder(w).Encode(map[string]any{"providers": list}); err != nil {
 			t.Errorf("failed to write providers response: %v", err)
@@ -867,7 +872,7 @@ func TestDoLoopAssignsBagInCandidateOrder(t *testing.T) {
 		providers = append(providers, &Provider{ID: testKey(i)})
 	}
 	var providerRequests atomic.Int32
-	srv := newLoopHTTPServer(t, bag.BagID, keys, &providerRequests)
+	srv := newLoopHTTPServer(t, bag.BagID, keys, nil, &providerRequests)
 	defer srv.Close()
 
 	bagID, err := hex.DecodeString(bag.BagID)
@@ -902,6 +907,158 @@ func TestDoLoopAssignsBagInCandidateOrder(t *testing.T) {
 	}
 	if _, ok := addedProviders[base64.StdEncoding.EncodeToString(want)+"_"+bag.BagID]; !ok {
 		t.Fatalf("bag was not given to the first candidate %x: got %v", want, addedProviders)
+	}
+}
+
+func TestDoLoopSpreadsReplicasAcrossCountries(t *testing.T) {
+	// "de" is the same country as "DE", providers without a country share one "unknown"
+	keys := [][]byte{testKey(0x41), testKey(0x44), testKey(0x45), testKey(0x43), testKey(0x42)}
+	countries := []string{"DE", "de", "", "", "FR"}
+
+	got := runCountryLoop(t, 3, keys, countries, nil)
+	if want := map[string]int{"DE": 1, "": 1, "FR": 1}; !maps.Equal(got, want) {
+		t.Fatalf("added countries mismatch: got %v, want %v", got, want)
+	}
+}
+
+func TestDoLoopFillsReplicasWhenCountriesRunOut(t *testing.T) {
+	keys := [][]byte{testKey(0x51), testKey(0x52), testKey(0x53)}
+	countries := []string{"DE", "DE", "DE"}
+
+	got := runCountryLoop(t, 3, keys, countries, nil)
+	if want := map[string]int{"DE": 3}; !maps.Equal(got, want) {
+		t.Fatalf("added countries mismatch: got %v, want %v", got, want)
+	}
+}
+
+func TestDoLoopCountsCountryOfExistingReplica(t *testing.T) {
+	// 0x61 is already on the contract
+	keys := [][]byte{testKey(0x63), testKey(0x61), testKey(0x64)}
+	countries := []string{"DE", "DE", "FR"}
+
+	got := runCountryLoop(t, 2, keys, countries, []any{testContractProvider(testKey(0x61))})
+	if want := map[string]int{"FR": 1}; !maps.Equal(got, want) {
+		t.Fatalf("added countries mismatch: got %v, want %v", got, want)
+	}
+}
+
+func TestDoLoopCountsReplicaMissingFromListAsUnknown(t *testing.T) {
+	// 0x94 is already on the contract, but not in the API list
+	keys := [][]byte{testKey(0x91), testKey(0x93)}
+	countries := []string{"", "FR"}
+
+	got := runCountryLoop(t, 2, keys, countries, []any{testContractProvider(testKey(0x94))})
+	if want := map[string]int{"FR": 1}; !maps.Equal(got, want) {
+		t.Fatalf("added countries mismatch: got %v, want %v", got, want)
+	}
+}
+
+func TestDoLoopAsksProviderRatesOncePerBag(t *testing.T) {
+	withLoopTestEnv(t)
+	*replicas = 1
+	*noTx = true
+
+	bag := testBagDetailed()
+	preloadBags(t, []*storage.BagDetailed{bag})
+
+	var providerRequests atomic.Int32
+	srv := newLoopHTTPServer(t, bag.BagID, [][]byte{testKey(0x81)}, nil, &providerRequests)
+	defer srv.Close()
+
+	// refuses the bag in the first pass, the second pass must not ask again
+	fProvider := &fakeProvider{rates: &transport.StorageRatesResponse{Available: false}}
+	deps := loopDeps{
+		wallet:     testWallet(tlb.MustFromTON("100")),
+		storage:    &fakeStorage{},
+		provider:   fProvider,
+		api:        &fakeAPI{},
+		httpClient: srv.Client(),
+		waitMaster: func(ctx context.Context, api ton.APIClientWrapped, minSeqno uint32) (*ton.BlockIDExt, error) {
+			return testMaster(100), nil
+		},
+		sendManyWait: func(ctx context.Context, wl loopWallet, api ton.APIClientWrapped, messages []*wallet.Message, minSeqno uint32) (*tlb.Transaction, *ton.BlockIDExt, error) {
+			t.Fatalf("unexpected transaction send with %d messages", len(messages))
+			return nil, nil, nil
+		},
+	}
+
+	if _, err := doLoopWithDeps(deps, srv.URL+"/index", srv.URL+"/providers", 0); err != nil {
+		t.Fatalf("doLoopWithDeps returned error: %v", err)
+	}
+	if got := fProvider.ratesCalls.Load(); got != 1 {
+		t.Fatalf("rates calls mismatch: got %d, want 1", got)
+	}
+	if len(addedProviders) != 0 {
+		t.Fatalf("added providers mismatch: got %v, want none", addedProviders)
+	}
+}
+
+// runCountryLoop runs one loop for the test bag and returns how many providers
+// of each country were added to it. Keys must be listed in the candidate order
+// of the test bag, so the expected result follows from the countries alone.
+func runCountryLoop(t *testing.T, replicasNum int, keys [][]byte, countries []string, contractProviders []any) map[string]int {
+	t.Helper()
+	withLoopTestEnv(t)
+	*replicas = replicasNum
+	*noTx = true
+
+	bag := testBagDetailed()
+	preloadBags(t, []*storage.BagDetailed{bag})
+
+	bagID, err := hex.DecodeString(bag.BagID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var providers []*Provider
+	for _, key := range keys {
+		providers = append(providers, &Provider{ID: key})
+	}
+	if !sameProviderOrder(candidateOrder(bagID, providers), providers) {
+		t.Fatal("keys must be listed in the candidate order of the test bag")
+	}
+
+	var providerRequests atomic.Int32
+	srv := newLoopHTTPServer(t, bag.BagID, keys, countries, &providerRequests)
+	defer srv.Close()
+
+	deps := loopDeps{
+		wallet:     testWallet(tlb.MustFromTON("100")),
+		storage:    &fakeStorage{},
+		provider:   &fakeProvider{rates: testAvailableRates()},
+		api:        &fakeAPI{providersTuple: contractProviders},
+		httpClient: srv.Client(),
+		waitMaster: func(ctx context.Context, api ton.APIClientWrapped, minSeqno uint32) (*ton.BlockIDExt, error) {
+			return testMaster(100), nil
+		},
+		sendManyWait: func(ctx context.Context, wl loopWallet, api ton.APIClientWrapped, messages []*wallet.Message, minSeqno uint32) (*tlb.Transaction, *ton.BlockIDExt, error) {
+			t.Fatalf("unexpected transaction send with %d messages", len(messages))
+			return nil, nil, nil
+		},
+	}
+
+	if _, err := doLoopWithDeps(deps, srv.URL+"/index", srv.URL+"/providers", 0); err != nil {
+		t.Fatalf("doLoopWithDeps returned error: %v", err)
+	}
+
+	added := map[string]int{}
+	for i, key := range keys {
+		if _, ok := addedProviders[base64.StdEncoding.EncodeToString(key)+"_"+bag.BagID]; ok {
+			added[countries[i]]++
+		}
+	}
+	return added
+}
+
+// testContractProvider is a provider entry as contract.GetProvidersV1 parses it,
+// with a fresh proof so the loop keeps it as a replica.
+func testContractProvider(key []byte) []any {
+	return []any{
+		new(big.Int).SetBytes(key),
+		tlb.MustFromTON("0.00001").Nano(),
+		big.NewInt(3600),
+		big.NewInt(time.Now().Unix()),
+		big.NewInt(0),
+		big.NewInt(0),
 	}
 }
 
